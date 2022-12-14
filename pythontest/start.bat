@@ -1,0 +1,1 @@
+python -B %~dp0\proj\main.py
