@@ -1,46 +1,27 @@
 #include <iostream>
-#include <cstdlib>
-#include <cstring>
-#include <malloc.h>
 using namespace std;
-
-#define MAX 6
 
 class A
 {
 	public:
-		void M(){
-			cout << "A M" << endl;
-		}
+    	explicit A(int p):p(p){cout << "construct" << p << " " << this << endl;}
+		~A(){cout << "delete" << p << endl;}
+		A (const A &obj) {cout << "copy" << endl;}
+        int p = 10;
 };
-
-class B
+ 
+A GetA()
 {
-	public:
-		void M(){
-			cout << "B M" << endl;
-		}
-};
-
-class C
-{
-	public:
-		void M(){
-			cout << "C M" << endl;
-		}
-};
-
-class children: public A, public B, public C
-{
-	public:
-		void M(){
-			cout<< "ff" << endl;
-		}
-};
-
+    return A(1);
+}
+ 
 int main()
 {
-	children child;
-	child.M();
+    // A a1 = GetA();   // a1是左值
+    // //A&& a2 = GetA(); // a2是右值引用
+    // cout<< a1.p << endl;
+    // cout<<GetA().p << endl;
+    A a1 = GetA();
+    cout << &a1 << endl;
     return 0;
 }
