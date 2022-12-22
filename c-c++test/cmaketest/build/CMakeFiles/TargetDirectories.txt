@@ -1,0 +1,2 @@
+C:/Users/weihuawei/Desktop/codetest/c-c++test/cmaketest/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/weihuawei/Desktop/codetest/c-c++test/cmaketest/build/CMakeFiles/ZERO_CHECK.dir

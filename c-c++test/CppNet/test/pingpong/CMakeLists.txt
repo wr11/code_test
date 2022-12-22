@@ -1,0 +1,21 @@
+project(pingpongserver)
+add_executable(${PROJECT_NAME} server.cpp)
+
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} cppnet)
+    target_link_libraries(${PROJECT_NAME} ws2_32)
+else()
+    target_link_libraries(${PROJECT_NAME} cppnet)
+    target_link_libraries(${PROJECT_NAME} pthread)
+endif()
+
+project(pingpongclient)
+add_executable(${PROJECT_NAME} client.cpp)
+
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} cppnet)
+    target_link_libraries(${PROJECT_NAME} ws2_32)
+else()
+    target_link_libraries(${PROJECT_NAME} cppnet)
+    target_link_libraries(${PROJECT_NAME} pthread)
+endif()

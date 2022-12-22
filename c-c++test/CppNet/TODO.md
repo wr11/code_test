@@ -1,0 +1,21 @@
+- [x] IOCP supports multiple accept events
+- [x] logger support stream 
+- [x] support IPV6 
+- [x] remove default thread number to iocp
+- [x] format files name
+- [x] restruct event action support iocp
+- [x] add thread safe alloter
+- [x] valgrind check memory 
+- [x] ab performance testing
+- [x] update document
+- [x] client socket add accept socket number
+- [x] delete cppnet instance destory lib
+- [x] add socket content
+- [x] multi listen port example
+- [x] pingpong test on windows
+- [x] quick start document
+- [ ] pingpong performance testing
+- [ ] IOCP lost disconnection event
+- [ ] windows timer wakeup other thread
+- [ ] memory leak check
+- [ ] windows use wepoll
