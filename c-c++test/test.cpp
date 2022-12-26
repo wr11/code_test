@@ -1,27 +1,23 @@
-#include <iostream>
-using namespace std;
 
-class A
+#include <iostream>
+#include <thread>
+#include <vector>
+using namespace std;
+ 
+struct test
 {
-	public:
-    	explicit A(int p):p(p){cout << "construct" << p << " " << this << endl;}
-		~A(){cout << "delete" << p << endl;}
-		A (const A &obj) {cout << "copy" << endl;}
-        int p = 10;
+	int a;
 };
  
-A GetA()
-{
-    return A(1);
-}
+int main() {
  
-int main()
-{
-    // A a1 = GetA();   // a1是左值
-    // //A&& a2 = GetA(); // a2是右值引用
-    // cout<< a1.p << endl;
-    // cout<<GetA().p << endl;
-    A a1 = GetA();
-    cout << &a1 << endl;
-    return 0;
+	struct test t;
+	vector<struct test*> vt;
+	vt.push_back(&t);
+	for (int i = 0; i < vt.size() ; i++ )
+	{
+		cout << vt[i] << endl;
+	}
+ 
+	return 0;
 }
