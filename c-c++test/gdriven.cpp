@@ -28,6 +28,7 @@ static const bool _DEBUG = true;
 static const bool _NONBLOCK = true;
 static const bool _REUSEPORT = true;
 static const bool _ALLOW_THREAD_INCOMPLETE = true;
+static const int _MAX_EPOLL_WAIT_EVENT_SIZE = 1024;
 // end region conf
 
 struct NetParam
@@ -110,8 +111,12 @@ class COSHandler
         virtual int SetSocketNonBlocking(int socket) = 0;
         virtual bool Bind(int socket, struct NetParam* np) = 0;
         virtual bool Listen(int socket, int backlog_len) = 0;
-        virtual bool Accept(int socket, struct sockaddr_in *cli_addr) = 0;
         virtual bool GenerateSocketEvent(int socket, struct NetThread_Linux* nt) = 0;
+        virtual void EventLoop(struct NetThread_Linux* nt) = 0;
+        virtual bool AddListener(struct NetThread_Linux* nt) = 0;
+        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd) = 0;
+        virtual void Receive(int socket, char* buffer) = 0;
+        virtual void Send(int socket) = 0;
     protected:
         void _WrongOS(){GPRINTE("Unsupport operate system!");exit(EXIT_FAILURE);};
 };
@@ -124,10 +129,13 @@ class CLinuxHandler : public COSHandler
         virtual int SetSocketNonBlocking(int socket);
         virtual bool Bind(int socket, struct NetParam* np);
         virtual bool Listen(int socket, int backlog_len);
-        virtual bool Accept(int socket, struct sockaddr_in *cli_addr);
         virtual bool GenerateSocketEvent(int socket, struct NetThread_Linux* nt);
+        virtual void EventLoop(struct NetThread_Linux* nt);
+        virtual bool AddListener(struct NetThread_Linux* nt);
+        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd);
+        virtual void Receive(int socket, char* buffer);
+        virtual void Send(int socket){};
         int SetSocketReusePort(int socket);
-        bool AddListener(int fd_epoll, int fd_socket, struct NetThread_Linux* nt);
 };
 
 class COtherOSHandler : public COSHandler
@@ -165,6 +173,7 @@ int CLinuxHandler::CreateSocket(struct NetParam* np)
     if (socket_fd < 0)
     {
         GPRINTE("create socket error");
+        perror("create socket");
         return -1;
     }
     if (_NONBLOCK)
@@ -184,12 +193,14 @@ int CLinuxHandler::SetSocketNonBlocking(int socket)
     if (old_option < 0)
     {
         GPRINTE("get fcntl flag error");
+        perror("get fcnt");
         return -1;
     }
     int new_option = old_option | O_NONBLOCK;
     if (fcntl(socket, F_SETFL, new_option) < 0)
     {
         GPRINTE("set fcntl non blocking error");
+        perror("set fcnt");
         return -1;
     }
     return old_option;
@@ -214,6 +225,7 @@ bool CLinuxHandler::Bind(int socket, struct NetParam* np)
     if (bind(socket, (const struct sockaddr *)server_addr, sizeof(*server_addr)) < 0)
     {
         GPRINTE("socket bind failed!");
+        perror("bind");
         free(server_addr);
         close(socket);
         return false;
@@ -232,22 +244,11 @@ bool CLinuxHandler::Listen(int socket, int backlog_len)
     if (ret < 0)
     {
         GPRINTE("socket listen failed!");
+        perror("listen");
         close(socket);
         return false;
     }
     return true;
-}
-
-bool CLinuxHandler::Accept(int socket, struct sockaddr_in *cli_addr)
-{
-    socklen_t len = sizeof(struct sockaddr_in);
-    int client_fd = accept(socket, (struct sockaddr *)cli_addr, &len);
-    if (client_fd < 0)
-    {
-        GPRINTE("socket accept failed!");
-        return -1;
-    }
-    return client_fd;
 }
 
 bool CLinuxHandler::GenerateSocketEvent(int socket, struct NetThread_Linux* nt)
@@ -256,34 +257,103 @@ bool CLinuxHandler::GenerateSocketEvent(int socket, struct NetThread_Linux* nt)
     if (epoll_fd < 0)
     {
         GPRINTE("epoll_create failed!");
+        perror("epoll_create");
         close(socket);
         return false;
     }
     nt->fd_socket = socket;
     nt->fd_epoll = epoll_fd;
     nt->writable = false;
+    return true;
+}
 
-    if (!this->AddListener(epoll_fd, socket, nt))
+bool CLinuxHandler::AddListener(struct NetThread_Linux* nt)
+{
+    struct epoll_event ev;
+    ev.events = EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET;
+    ev.data.ptr = nt;
+    int ret = epoll_ctl(nt->fd_epoll, EPOLL_CTL_ADD, nt->fd_socket, &ev);
+    if (ret < 0)
     {
+        GPRINTE("epollctl add failed! closing ...");
+        perror("epollctl add failed");
+        close(nt->fd_epoll);
+        close(nt->fd_socket);
         return false;
     }
     return true;
 }
 
-bool CLinuxHandler::AddListener(int fd_epoll, int fd_socket, struct NetThread_Linux* nt)
+void CLinuxHandler::EventLoop(struct NetThread_Linux* nt)
 {
-    struct epoll_event ev;
-    ev.events = EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET;
-    ev.data.ptr = nt;
-    int ret = epoll_ctl(fd_epoll, EPOLL_CTL_ADD, fd_socket, &ev);
-    if (ret < 0)
+    GPRINTD("Loop Start");
+    struct epoll_event *ev = (struct epoll_event *)malloc(sizeof(struct epoll_event)*_MAX_EPOLL_WAIT_EVENT_SIZE);
+    struct sockaddr_in *client_addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
+    socklen_t sock_len = sizeof(struct sockaddr_in);
+    char *buffer = (char *)malloc(sizeof(char)*4096);
+    while(true)
     {
-        GPRINTE("epollctl add failed! closing ...");
-        close(fd_epoll);
-        close(fd_socket);
-        return false;
+        memset(ev, 0, sizeof(*ev));
+        int num_fds = epoll_wait(nt->fd_epoll, ev, _MAX_EPOLL_WAIT_EVENT_SIZE, -1);
+        switch(num_fds)
+        {
+            case -1:
+                if (errno == EINTR) continue;
+                else{
+                    GPRINTE("epoll wait error!");
+                    perror("epoll wait");
+                    return;
+                }
+            case 0:
+                continue;
+            default:
+                for (int i = 0; i < num_fds; i++)
+                {
+                    struct NetThread_Linux* nt_new = (struct NetThread_Linux*)ev[i].data.ptr;
+                    if (nt_new->fd_socket == nt->fd_socket)
+                    {
+                        GPRINTD("wake up");
+                        memset(client_addr, 0, sizeof(*client_addr));
+                        this->Accept(nt->fd_socket, client_addr, &sock_len, nt->fd_epoll);
+                    }
+                    else if (ev[i].events & EPOLLIN)
+                    {
+                        memset(buffer, 0, sizeof(*buffer));
+                        this->Receive(nt->fd_socket, buffer);
+                    }
+                }
+        }
     }
-    return true;
+    free(ev);
+    free(client_addr);
+}
+
+void CLinuxHandler::Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd)
+{
+    while(true)
+    {
+        int client_fd = accept(socket, (struct sockaddr *)client_addr, addr_len);
+        if (client_fd < 0)
+        {
+            if (errno == EAGAIN) break;
+            GPRINTE("accept failed!");
+            perror("accept failed");
+            break;
+        }
+        this->SetSocketNonBlocking(client_fd);
+
+        struct NetThread_Linux nt;
+        nt.fd_epoll = epoll_fd;
+        nt.fd_socket = client_fd;
+        nt.writable = true;
+        this->AddListener(&nt);
+        GPRINTD("accept success");
+    }
+}
+
+void CLinuxHandler::Receive(int socket, char* buffer)
+{
+    GPRINTD("Receive");
 }
 //end region os
 
@@ -297,21 +367,21 @@ class CNetBase
             _net_param = NULL;
             for (int i = 0; i < this->vec_event.size(); i++)
             {
-                close(vec_event[i]->fd_socket);
-                close(vec_event[i]->fd_epoll);
+                close(vec_event[i].fd_socket);
+                close(vec_event[i].fd_epoll);
             }
         };
         void PrintNetParam(){cout << this->_net_param->ip << " " << this->_net_param->port << " " << this->_net_param->thread_num << endl;};
         struct NetParam* GetPeer(){return this->_net_param;};
         void Run();
-        static void Loop();
+        static void ThreadBoot(CNetBase* net_base, struct NetThread_Linux* nt);
     private:
         struct NetParam* _net_param;
         shared_ptr<COSHandler> _os_handler;
 #if EPOLL_OS
-        vector<struct NetThread_Linux*> vec_event;
+        vector<struct NetThread_Linux> vec_event;
 #else
-        vector<struct NetThread_Other*> vec_event;
+        vector<struct NetThread_Other> vec_event;
 #endif
 };
 
@@ -348,7 +418,11 @@ void CNetBase::Run()
         struct NetThread_Linux nt;
         if (this->_os_handler->GenerateSocketEvent(socket, &nt))
         {
-            this->vec_event.push_back(&nt);
+            this->vec_event.push_back(nt);
+        }
+        else
+        {
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -365,7 +439,7 @@ void CNetBase::Run()
     vector<shared_ptr<thread>> _thread_vec;
     for (int i = 0; i < this->vec_event.size(); i++)
     {
-        shared_ptr<thread> thd(new thread(&CNetBase::Loop));
+        shared_ptr<thread> thd(new thread(CNetBase::ThreadBoot, this, &(this->vec_event[i])));
         _thread_vec.push_back(thd);
     }
     for (size_t i = 0; i < _thread_vec.size(); i++) {
@@ -373,9 +447,15 @@ void CNetBase::Run()
     }
 }
 
-void CNetBase::Loop()
+void CNetBase::ThreadBoot(CNetBase* net_base, struct NetThread_Linux* nt)
 {
-    GPRINTD("loop start");
+    if (!net_base->_os_handler->AddListener(nt))
+    {
+        GPRINTE("epoll add listener error!");
+        perror("epoll add listener");
+        return;
+    }
+    net_base->_os_handler->EventLoop(nt);
 }
 
 class CNet
