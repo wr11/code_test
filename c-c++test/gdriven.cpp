@@ -3,7 +3,6 @@
 #include <string>
 #include <memory>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -13,11 +12,18 @@
 #include <fcntl.h>
 #include <thread>
 #include <vector>
+#include <malloc.h>
+#include <unordered_map>
 
 #define EPOLL_OS __linux__ || __unix__
 
+#ifdef __win__
+#include <ws2tcpip.h>
+#endif
+
 #if EPOLL_OS
 #include <linux/version.h>
+#include <arpa/inet.h>
 #define VERSION_MIN = KERNEL_VERSION(4,5,0)
 #endif
 
@@ -29,6 +35,10 @@ static const bool _NONBLOCK = true;
 static const bool _REUSEPORT = true;
 static const bool _ALLOW_THREAD_INCOMPLETE = true;
 static const int _MAX_EPOLL_WAIT_EVENT_SIZE = 1024;
+static const int _MAX_RECEIVE_ONCE_SIZE = 1024;
+static const int _MAX_RECEIVE_BUFFER_SIZE = 4104;
+static const int _MAX_SEND_BUFFER_SIZE = 4104;
+static const int _IP_INFO_LEN = 17;
 // end region conf
 
 struct NetParam
@@ -102,7 +112,212 @@ namespace Print{
 #define GPRINTD(MSG) ({Print::Debug(__FILE__,__FUNCTION__,__LINE__,MSG);})
 // end region print
 
+// region auto buffer
+class CLoopBuffer
+{
+    public:
+        CLoopBuffer(int size);
+        ~CLoopBuffer();
+        void Reset();
+        bool Write(char* content, int size);
+        bool Read(char* content, int size);
+        int GetReadSize();
+        int GetWriteableSize();
+        int GetReadableSize();
+    private:
+        char* _read_ptr;
+        char* _write_ptr;
+        char* _malloc_start_ptr;
+        char* _malloc_end_ptr;
+        int _malloc_real_size;
+        void _PrintPtr();
+};
+
+CLoopBuffer::CLoopBuffer(int size)
+{
+    this->_malloc_start_ptr = (char *)malloc(sizeof(char) * size);
+    this->_malloc_real_size = malloc_usable_size(this->_malloc_start_ptr);
+    this->_read_ptr = this->_malloc_start_ptr;
+    this->_write_ptr = this->_malloc_start_ptr;
+    this->_malloc_end_ptr = this->_malloc_start_ptr + this->_malloc_real_size - 1;
+}
+
+CLoopBuffer::~CLoopBuffer()
+{
+    free(this->_malloc_start_ptr);
+    this->_malloc_start_ptr = NULL;
+    this->_malloc_end_ptr = NULL;
+    this->_read_ptr = NULL;
+    this->_write_ptr = NULL;
+}
+
+void CLoopBuffer::_PrintPtr()
+{
+    cout << "_malloc_start_ptr: " << (void *)this->_malloc_start_ptr << endl \
+        << "_malloc_end_ptr: " << (void *)this->_malloc_end_ptr << endl \
+        << "_read_ptr: " << (void *)this->_read_ptr << endl \
+        << "_write_ptr: " << (void *)this->_write_ptr << endl;
+}
+
+void CLoopBuffer::Reset()
+{
+    this->_read_ptr = this->_malloc_start_ptr;
+    this->_write_ptr = this->_malloc_start_ptr;
+}
+
+int CLoopBuffer::GetWriteableSize()
+{
+    if (this->_write_ptr > this->_read_ptr || this->_write_ptr == this->_read_ptr)
+    {
+        return (this->_malloc_end_ptr - this->_write_ptr + 1) + (this->_read_ptr - this->_malloc_start_ptr);
+    }
+    else
+    {
+        return (this->_read_ptr - this->_write_ptr);
+    }
+}
+
+int CLoopBuffer::GetReadableSize()
+{
+    if (this->_read_ptr < this->_write_ptr || this->_read_ptr == this->_write_ptr)
+    {
+        return (this->_write_ptr - this->_read_ptr);
+    }
+    else
+    {
+        return (this->_malloc_end_ptr - this->_read_ptr + 1) + (this->_write_ptr - this->_malloc_start_ptr);
+    }
+}
+
+int CLoopBuffer::GetReadSize()
+{
+    int readable_size = this->GetReadableSize();
+    if (readable_size == 0) return 0;
+    else{
+        int size = 0;
+        if (this->_read_ptr < this->_write_ptr)
+        {
+            for (int i = 0; i < readable_size; i++)
+            {
+                if (*(this->_read_ptr + i) == '\0'){
+                    return size+1;
+                }
+                else{
+                    size = size + 1;
+                }
+            }
+            return size;
+        }
+        else
+        {
+            int to_end_size = this->_malloc_end_ptr - this->_read_ptr + 1;
+            int start_to_size = this->_write_ptr - this->_malloc_start_ptr;
+            for (int i = 0; i < to_end_size; i++)
+            {
+                if (*(this->_read_ptr + i) == '\0')
+                {
+                    return size+1;
+                }
+                else{
+                    size = size + 1;
+                }
+            }
+            for (int i = 0; i < start_to_size; i++)
+            {
+                if (*(this->_malloc_start_ptr + i) == '\0')
+                {
+                    return size+1;
+                }
+                else{
+                    size = size + 1;
+                }
+            }
+            return size;
+        }
+    }
+}
+
+bool CLoopBuffer::Write(char* content, int size)
+{
+    if (this->GetWriteableSize() < size)
+    {
+        GPRINTE("size tool large");
+        return false;
+    }
+    if (this->_write_ptr + size > this->_malloc_end_ptr)
+    {
+        int to_end_size = this->_malloc_end_ptr - this->_write_ptr + 1;
+        int start_to_size = size - to_end_size;
+        void* ret1 = memmove(this->_write_ptr, content, to_end_size);
+        void* ret2 = memmove(this->_malloc_start_ptr, content + to_end_size, start_to_size);
+        if (ret1 && ret2){
+            this->_write_ptr = this->_malloc_start_ptr + start_to_size;
+            return true;
+        }
+        else{
+            GPRINTE("memmove failed");
+            return false;
+        }
+    }
+    else
+    {
+        void* ret3 = memmove(this->_write_ptr, content, size);
+        if (ret3)
+        {
+            this->_write_ptr = this->_write_ptr + size;
+            return true;
+        }
+        else{
+            GPRINTE("memmove failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CLoopBuffer::Read(char *content, int size)
+{
+    int readable_size = this->GetReadableSize();
+    if (readable_size == 0)
+    {
+        GPRINTE("nothing to read");
+        return false;
+    }
+    if (this->_read_ptr + size < this->_malloc_end_ptr || this->_read_ptr + size == this->_malloc_end_ptr)
+    {
+        void* ret = memmove(content, this->_read_ptr, size);
+        if (ret)
+        {
+            this->_read_ptr = this->_read_ptr + size;
+            return true;
+        }
+        else{
+            GPRINTE("memmove failed");
+            return false;
+        }
+    }
+    else
+    {
+        int to_end_size = this->_malloc_end_ptr - this->_read_ptr + 1;
+        int start_to_size = size - to_end_size;
+        void* ret1 = memmove(content, this->_read_ptr, to_end_size);
+        void* ret2 = memmove(content+to_end_size, this->_malloc_start_ptr, start_to_size);
+        if (ret1 && ret2)
+        {
+            this->_read_ptr = this->_malloc_start_ptr + (size - to_end_size);
+            return true;
+        }
+        else{
+            GPRINTE("memmove failed");
+            return false;
+        }
+    }
+}
+// end region auto buffer
+
 // region os
+class CNetBase;
+
 class COSHandler
 {
     public:
@@ -112,11 +327,13 @@ class COSHandler
         virtual bool Bind(int socket, struct NetParam* np) = 0;
         virtual bool Listen(int socket, int backlog_len) = 0;
         virtual bool GenerateSocketEvent(int socket, struct NetThread_Linux* nt) = 0;
-        virtual void EventLoop(struct NetThread_Linux* nt) = 0;
-        virtual bool AddListener(struct NetThread_Linux* nt) = 0;
-        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd) = 0;
-        virtual void Receive(int socket, char* buffer) = 0;
-        virtual void Send(int socket) = 0;
+        virtual void EventLoop(struct NetThread_Linux* nt, CNetBase *net_base) = 0;
+        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, \
+                int epoll_fd, struct NetThread_Linux* nt) = 0;
+        virtual void Receive(struct NetThread_Linux* nt, char* buffer, CNetBase *net_base) = 0;
+        virtual void Disconnect(struct NetThread_Linux* nt) = 0;
+        virtual bool Send(struct NetThread_Linux* nt, char* buffer, int size, int flag) = 0;
+        virtual bool HandleSocketListener(struct NetThread_Linux* nt, int events, int type)=0;
     protected:
         void _WrongOS(){GPRINTE("Unsupport operate system!");exit(EXIT_FAILURE);};
 };
@@ -130,18 +347,57 @@ class CLinuxHandler : public COSHandler
         virtual bool Bind(int socket, struct NetParam* np);
         virtual bool Listen(int socket, int backlog_len);
         virtual bool GenerateSocketEvent(int socket, struct NetThread_Linux* nt);
-        virtual void EventLoop(struct NetThread_Linux* nt);
-        virtual bool AddListener(struct NetThread_Linux* nt);
-        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd);
-        virtual void Receive(int socket, char* buffer);
-        virtual void Send(int socket){};
+        virtual void EventLoop(struct NetThread_Linux* nt, CNetBase *net_base);
+        virtual void Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, \
+                int epoll_fd, struct NetThread_Linux* nt);
+        virtual void Receive(struct NetThread_Linux* nt, char* buffer, CNetBase *net_base);
+        virtual void Disconnect(struct NetThread_Linux* nt);
+        virtual bool Send(struct NetThread_Linux* nt, char* buffer, int size, int flag);
+        virtual bool HandleSocketListener(struct NetThread_Linux* nt, int events, int type);
         int SetSocketReusePort(int socket);
+        void Writeable(struct NetThread_Linux* nt, CNetBase *net_base);
 };
 
 class COtherOSHandler : public COSHandler
 {
     public:
         virtual void CheckOS(struct NetParam* np){this->_WrongOS();};
+};
+
+class CSocketUser: public std::enable_shared_from_this<CSocketUser>
+{
+    public:
+        CSocketUser(struct NetThread_Linux* nt);
+        ~CSocketUser(){free(this->_nt);};
+        static shared_ptr<CSocketUser> GetSocketUser(int fd_socket);
+        static size_t DelSocketUser(int fd_socket);
+
+        bool Send(string buffer, int flag);
+        void Disconnect();
+
+        void ResetRecvBuffer();
+        void ResetSendBuffer();
+        string Read();
+        string ReadAll();
+        int GetReadableSize();
+        int GetReadSize();
+        bool Read(char* content, int size);
+        void SetWriteable();
+        void AddSocketUser();
+        void SetAddr(struct sockaddr *addr);
+        const char* GetIP(char *buff, int size);
+        int GetPort();
+        int GetSocketFD();
+
+        shared_ptr<CLoopBuffer> _GetRecvBuffer();
+        shared_ptr<CLoopBuffer> _GetSendBuffer();
+    private:
+        struct sockaddr* _addr;
+        struct NetThread_Linux* _nt;
+        shared_ptr<COSHandler> _os_handler;
+        shared_ptr<CLoopBuffer> _recv_buffer;
+        shared_ptr<CLoopBuffer> _send_buffer;
+        static thread_local unordered_map<uint64_t, shared_ptr<CSocketUser>> __all_socket_map;
 };
 
 void CLinuxHandler::CheckOS(struct NetParam* np)
@@ -267,12 +523,22 @@ bool CLinuxHandler::GenerateSocketEvent(int socket, struct NetThread_Linux* nt)
     return true;
 }
 
-bool CLinuxHandler::AddListener(struct NetThread_Linux* nt)
+bool CLinuxHandler::HandleSocketListener(struct NetThread_Linux* nt, int events, int type)
 {
     struct epoll_event ev;
-    ev.events = EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET;
+    ev.events = events;
     ev.data.ptr = nt;
-    int ret = epoll_ctl(nt->fd_epoll, EPOLL_CTL_ADD, nt->fd_socket, &ev);
+    int ret;
+    if (type == 0){
+        ret = epoll_ctl(nt->fd_epoll, EPOLL_CTL_MOD, nt->fd_socket, &ev);
+    }
+    else if (type < 0)
+    {
+        ret = epoll_ctl(nt->fd_epoll, EPOLL_CTL_DEL, nt->fd_socket, &ev);
+    }
+    else{
+        ret = epoll_ctl(nt->fd_epoll, EPOLL_CTL_ADD, nt->fd_socket, &ev);
+    }
     if (ret < 0)
     {
         GPRINTE("epollctl add failed! closing ...");
@@ -284,78 +550,240 @@ bool CLinuxHandler::AddListener(struct NetThread_Linux* nt)
     return true;
 }
 
-void CLinuxHandler::EventLoop(struct NetThread_Linux* nt)
+void CLinuxHandler::EventLoop(struct NetThread_Linux* nt, CNetBase *net_base)
 {
     GPRINTD("Loop Start");
     struct epoll_event *ev = (struct epoll_event *)malloc(sizeof(struct epoll_event)*_MAX_EPOLL_WAIT_EVENT_SIZE);
     struct sockaddr_in *client_addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
+    struct NetThread_Linux *client_nt = (struct NetThread_Linux *)malloc(sizeof(struct NetThread_Linux));
     socklen_t sock_len = sizeof(struct sockaddr_in);
-    char *buffer = (char *)malloc(sizeof(char)*4096);
+    char *buffer = (char *)malloc(sizeof(char)*_MAX_RECEIVE_ONCE_SIZE);
     while(true)
     {
-        memset(ev, 0, sizeof(*ev));
+        memset(ev, 0, sizeof(struct epoll_event)*_MAX_EPOLL_WAIT_EVENT_SIZE);
         int num_fds = epoll_wait(nt->fd_epoll, ev, _MAX_EPOLL_WAIT_EVENT_SIZE, -1);
-        switch(num_fds)
+        if (num_fds < 0)
         {
-            case -1:
-                if (errno == EINTR) continue;
-                else{
-                    GPRINTE("epoll wait error!");
-                    perror("epoll wait");
-                    return;
-                }
-            case 0:
+            if (errno == EINTR)
+            {
                 continue;
-            default:
-                for (int i = 0; i < num_fds; i++)
+            }
+            else
+            {
+                GPRINTE("epoll wait error!");
+                perror("epoll wait");
+                return;
+            }
+        }
+        else if (num_fds == 0)
+        {
+            continue;
+        }
+        else
+        {
+            for (int i = 0; i < num_fds; i++)
+            {
+                struct NetThread_Linux* nt_new = (struct NetThread_Linux*)ev[i].data.ptr;
+                if (nt_new->fd_socket == nt->fd_socket)
                 {
-                    struct NetThread_Linux* nt_new = (struct NetThread_Linux*)ev[i].data.ptr;
-                    if (nt_new->fd_socket == nt->fd_socket)
-                    {
-                        GPRINTD("wake up");
-                        memset(client_addr, 0, sizeof(*client_addr));
-                        this->Accept(nt->fd_socket, client_addr, &sock_len, nt->fd_epoll);
-                    }
-                    else if (ev[i].events & EPOLLIN)
-                    {
-                        memset(buffer, 0, sizeof(*buffer));
-                        this->Receive(nt->fd_socket, buffer);
-                    }
+                    GPRINTD("wake up");
+                    memset(client_addr, 0, sizeof(sizeof(struct sockaddr_in)));
+                    memset(client_nt, 0, sizeof(struct NetThread_Linux));
+                    this->Accept(nt->fd_socket, client_addr, &sock_len, nt->fd_epoll, client_nt);
                 }
+                else if (ev[i].events & EPOLLIN)
+                {
+                    if (ev[i].events & EPOLLRDHUP)
+                    {
+                        this->Disconnect(nt_new);
+                        continue;
+                    }
+                    this->Receive(nt_new, buffer, net_base);
+                }
+                else if (ev[i].events & EPOLLOUT)
+                {
+                    this->Writeable(nt_new, net_base);
+                }
+            }
         }
     }
     free(ev);
     free(client_addr);
+    free(client_nt);
 }
 
-void CLinuxHandler::Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd)
+bool CLinuxHandler::Send(struct NetThread_Linux* nt, char* buffer, int size, int flag)
 {
-    while(true)
+    int ret = send(nt->fd_socket, buffer, size, 0);
+    if (ret < 0)
     {
-        int client_fd = accept(socket, (struct sockaddr *)client_addr, addr_len);
-        if (client_fd < 0)
-        {
-            if (errno == EAGAIN) break;
-            GPRINTE("accept failed!");
-            perror("accept failed");
-            break;
-        }
-        this->SetSocketNonBlocking(client_fd);
+        GPRINTW("send failed, put in cache, send agian when receive epoll out event");
+        return false;
+    }
+    return true;
+}
 
-        struct NetThread_Linux nt;
-        nt.fd_epoll = epoll_fd;
-        nt.fd_socket = client_fd;
-        nt.writable = true;
-        this->AddListener(&nt);
-        GPRINTD("accept success");
+thread_local unordered_map<uint64_t, shared_ptr<CSocketUser>> CSocketUser::__all_socket_map;
+
+CSocketUser::CSocketUser(struct NetThread_Linux* nt)
+{
+#if EPOLL_OS
+    this->_os_handler = make_shared<CLinuxHandler>();
+#else
+    this->_os_handler = make_shared<COtherOSHandler>();
+#endif
+
+    this->_nt = (struct NetThread_Linux*)malloc(sizeof(struct NetThread_Linux));
+    this->_nt->fd_epoll = nt->fd_epoll;
+    this->_nt->fd_socket = nt->fd_socket;
+    this->_nt->writable = nt->writable;
+
+    this->_addr = (struct sockaddr *)malloc(sizeof(struct sockaddr));
+
+    this->_recv_buffer = make_shared<CLoopBuffer>(_MAX_RECEIVE_BUFFER_SIZE);
+    this->_send_buffer = make_shared<CLoopBuffer>(_MAX_SEND_BUFFER_SIZE);
+}
+
+void CSocketUser::SetAddr(struct sockaddr *addr)
+{
+    memmove(this->_addr, addr, sizeof(struct sockaddr));
+}
+
+void CSocketUser::AddSocketUser()
+{
+    CSocketUser::__all_socket_map[this->_nt->fd_socket] = shared_from_this();
+}
+
+shared_ptr<CLoopBuffer> CSocketUser::_GetRecvBuffer()
+{
+    return this->_recv_buffer;
+}
+
+shared_ptr<CLoopBuffer> CSocketUser::_GetSendBuffer()
+{
+    return this->_send_buffer;
+}
+
+shared_ptr<CSocketUser> CSocketUser::GetSocketUser(int fd_socket)
+{
+    bool in_map = CSocketUser::__all_socket_map.find(fd_socket) != CSocketUser::__all_socket_map.end()? true:false;
+    if (in_map)
+    {
+        return CSocketUser::__all_socket_map.at(fd_socket);
+    }
+    else
+    {
+        return NULL;
     }
 }
 
-void CLinuxHandler::Receive(int socket, char* buffer)
+size_t CSocketUser::DelSocketUser(int fd_socket)
 {
-    GPRINTD("Receive");
+    return CSocketUser::__all_socket_map.erase(fd_socket);
+}
+
+bool CSocketUser::Send(string buffer, int flag = 0)
+{
+    int size = buffer.length() + 1;
+    const char* send_const = buffer.c_str();
+    char* send = nullptr;
+    send = const_cast<char *>(send_const);
+    if (this->_nt->writable)
+    {
+        bool ret = this->_os_handler->Send(this->_nt, send, size, flag);
+        if (ret){
+            return true;
+        }
+    }
+    this->_nt->writable = false;
+    bool ret = (this->_GetSendBuffer())->Write(send, size);
+    this->_os_handler->HandleSocketListener(this->_nt, EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, 0);
+    if (ret){
+        return true;
+    }
+    else{
+        return false;
+    }
+}
+
+void CSocketUser::Disconnect()
+{
+    this->_os_handler->Disconnect(this->_nt);
+}
+
+void CSocketUser::ResetRecvBuffer()
+{
+    (this->_GetRecvBuffer())->Reset();
+}
+
+void CSocketUser::ResetSendBuffer()
+{
+    (this->_GetSendBuffer())->Reset();
+}
+
+string CSocketUser::Read()
+{
+    int size = (this->_GetRecvBuffer())->GetReadSize();
+    char* content = (char *)malloc(sizeof(char) * size);
+    string result;
+    if ((this->_GetRecvBuffer())->Read(content, size))
+    {
+        result = content;
+    }
+    return result;
+}
+
+string CSocketUser::ReadAll()
+{
+    int size = (this->_GetRecvBuffer())->GetReadableSize();
+    char* content = (char *)malloc(sizeof(char) * size);
+    string result;
+    if ((this->_GetRecvBuffer())->Read(content, size))
+    {
+        result = content;
+    }
+    return result;
+}
+
+int CSocketUser::GetReadableSize()
+{
+    return (this->_GetRecvBuffer())->GetReadableSize();
+}
+
+int CSocketUser::GetReadSize()
+{
+    return (this->_GetRecvBuffer())->GetReadSize();
+}
+
+bool CSocketUser::Read(char* content, int size)
+{
+    return (this->_GetRecvBuffer())->Read(content, size);
+}
+
+void CSocketUser::SetWriteable()
+{
+    this->_nt->writable = true;
+}
+
+const char* CSocketUser::GetIP(char *buff, int size)
+{
+    struct sockaddr_in *addr = (struct sockaddr_in*)this->_addr;
+    return inet_ntop(AF_INET, &addr->sin_addr, buff, size);
+}
+
+int CSocketUser::GetPort()
+{
+    struct sockaddr_in *addr = (struct sockaddr_in*)this->_addr;
+    return addr->sin_port;
+}
+
+int CSocketUser::GetSocketFD()
+{
+    return this->_nt->fd_socket;
 }
 //end region os
+
+typedef std::shared_ptr<CSocketUser> SocketUser;
 
 // region net
 class CNetBase
@@ -375,6 +803,7 @@ class CNetBase
         struct NetParam* GetPeer(){return this->_net_param;};
         void Run();
         static void ThreadBoot(CNetBase* net_base, struct NetThread_Linux* nt);
+
     private:
         struct NetParam* _net_param;
         shared_ptr<COSHandler> _os_handler;
@@ -422,7 +851,8 @@ void CNetBase::Run()
         }
         else
         {
-            exit(EXIT_FAILURE);
+            close(socket);
+            continue;
         }
     }
 
@@ -433,6 +863,11 @@ void CNetBase::Run()
         notify = notify + "but in fact start thread num is " + to_string(this->vec_event.size());
         GPRINTN(notify);
         GPRINTE("because of _ALLOW_THREAD_INCOMPLETE(false), server will quit ...");
+        for (int i = 0; i < this->vec_event.size(); i++)
+        {
+            close(this->vec_event[i].fd_socket);
+            close(this->vec_event[i].fd_epoll);
+        }
         exit(EXIT_FAILURE);
     }
 
@@ -449,13 +884,13 @@ void CNetBase::Run()
 
 void CNetBase::ThreadBoot(CNetBase* net_base, struct NetThread_Linux* nt)
 {
-    if (!net_base->_os_handler->AddListener(nt))
+    if (!net_base->_os_handler->HandleSocketListener(nt, EPOLLIN|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, 1))
     {
         GPRINTE("epoll add listener error!");
         perror("epoll add listener");
         return;
     }
-    net_base->_os_handler->EventLoop(nt);
+    net_base->_os_handler->EventLoop(nt, net_base);
 }
 
 class CNet
@@ -469,9 +904,112 @@ class CNet
         void PrintNetParam(){this->_net_base->PrintNetParam();};
         void Run();
 
+        static void(* cb_accept)(shared_ptr<CSocketUser> socket_user);
+        static void(* cb_receive)(shared_ptr<CSocketUser> socket_user);
+        static void(* cb_disconnect)(shared_ptr<CSocketUser> socket_user);
+        static void(* cb_writeable)(shared_ptr<CSocketUser> socket_user);
+
+        static void ExcuteAcceptCallBack(SocketUser socket_user);
+        static void ExcuteReceiveCallBack(SocketUser socket_user);
+        static void ExcuteDisconnectCallBack(SocketUser socket_user);
+        static void ExcuteWriteableCallBack(SocketUser socket_user);
+
+        static void SetAcceptCallBack(void(* cb_accept)(shared_ptr<CSocketUser> socket_user));
+        static void SetReceiveCallBack(void(* cb_receive)(shared_ptr<CSocketUser> socket_user));
+        static void SetDisconnectCallBack(void(* cb_disconnect)(shared_ptr<CSocketUser> socket_user));
+        static void SetWriteableCallBack(void(* cb_writeable)(shared_ptr<CSocketUser> socket_user));
+
     private:
         shared_ptr<CNetBase> _net_base;
 };
+
+// region cb func
+
+void AcceptCallBack(SocketUser socket_user)
+{
+    GPRINTD("accept callback");
+    char buff[_IP_INFO_LEN];
+    cout << "IP: " << socket_user->GetIP(buff, _IP_INFO_LEN) << endl;
+    cout << "Port: " << socket_user->GetPort() << endl;
+    cout << "fd: " << socket_user->GetSocketFD() << endl;
+}
+
+void ReceiveCallBack(SocketUser socket_user)
+{
+    GPRINTD("receive callback");
+    string result = socket_user->Read();
+    cout << "receive: " << result << endl;
+
+    socket_user->Send(result);
+}
+
+void DisconnectCallBack(SocketUser socket_user)
+{
+    GPRINTD("disconnect callback");
+}
+
+void WritetableCallBack(SocketUser socket_user)
+{
+    GPRINTD("writeable callback");
+}
+// end region cb func
+
+void(* CNet::cb_accept)(shared_ptr<CSocketUser> socket_user) = AcceptCallBack;
+void(* CNet::cb_receive)(shared_ptr<CSocketUser> socket_user) = ReceiveCallBack;
+void(* CNet::cb_disconnect)(shared_ptr<CSocketUser> socket_user) = DisconnectCallBack;
+void(* CNet::cb_writeable)(shared_ptr<CSocketUser> socket_user) = WritetableCallBack;
+
+void CNet::ExcuteAcceptCallBack(SocketUser socket_user)
+{
+    if (CNet::cb_accept)
+    {
+        CNet::cb_accept(socket_user);
+    }
+}
+
+void CNet::ExcuteReceiveCallBack(SocketUser socket_user)
+{
+    if (CNet::cb_receive)
+    {
+        CNet::cb_receive(socket_user);
+    }
+}
+
+void CNet::ExcuteDisconnectCallBack(SocketUser socket_user)
+{
+    if (CNet::cb_disconnect)
+    {
+        CNet::cb_disconnect(socket_user);
+    }
+}
+
+void CNet::ExcuteWriteableCallBack(SocketUser socket_user)
+{
+    if (CNet::cb_writeable)
+    {
+        CNet::cb_writeable(socket_user);
+    }
+}
+
+void CNet::SetAcceptCallBack(void(* cb_accept)(shared_ptr<CSocketUser> socket_user))
+{
+    CNet::cb_accept = cb_accept;
+}
+
+void CNet::SetReceiveCallBack(void(* cb_receive)(shared_ptr<CSocketUser> socket_user))
+{
+    CNet::cb_receive = cb_receive;
+}
+
+void CNet::SetDisconnectCallBack(void(* cb_disconnect)(shared_ptr<CSocketUser> socket_user))
+{
+    CNet::cb_disconnect = cb_disconnect;
+}
+
+void CNet::SetWriteableCallBack(void(* cb_writeable)(shared_ptr<CSocketUser> socket_user))
+{
+    CNet::cb_writeable = cb_writeable;
+}
 
 void CNet::CheckNetParam(char* ip, char* port, char* thread_num, struct NetParam* np)
 {
@@ -522,7 +1060,102 @@ void CNet::Run()
 {
     this->_net_base->Run();
 }
+
+void CLinuxHandler::Accept(int socket, struct sockaddr_in* client_addr, socklen_t* addr_len, int epoll_fd, \
+        struct NetThread_Linux* client_nt)
+{
+    while(true)
+    {
+        int client_fd = accept(socket, (struct sockaddr *)client_addr, addr_len);
+        if (client_fd < 0)
+        {
+            if (errno == EAGAIN) break;
+            GPRINTE("accept failed!");
+            perror("accept failed");
+            break;
+        }
+        this->SetSocketNonBlocking(client_fd);
+
+        client_nt->fd_epoll = epoll_fd;
+        client_nt->fd_socket = client_fd;
+        client_nt->writable = true;
+        this->HandleSocketListener(client_nt, EPOLLIN|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, 1);
+
+        shared_ptr<CSocketUser> socket_user = make_shared<CSocketUser>(client_nt);
+        socket_user->AddSocketUser();
+        socket_user->SetAddr((struct sockaddr *)client_addr);
+
+        //cb(socket);
+        GPRINTD("accept success");
+        CNet::ExcuteAcceptCallBack(socket_user);
+    }
+}
+
+void CLinuxHandler::Disconnect(struct NetThread_Linux* nt)
+{
+    GPRINTN("client close socket positively fd: " + to_string(nt->fd_socket));
+    this->HandleSocketListener(nt, EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, -1);
+    close(nt->fd_socket);
+
+    CNet::ExcuteDisconnectCallBack(CSocketUser::GetSocketUser(nt->fd_socket));
+    CSocketUser::DelSocketUser(nt->fd_socket);
+}
+
+void CLinuxHandler::Receive(struct NetThread_Linux* nt, char* buffer, CNetBase *net_base)
+{
+    while(true)
+    {
+        memset(buffer, 0, sizeof(*buffer));
+        int byte_len = recv(nt->fd_socket, buffer, _MAX_RECEIVE_ONCE_SIZE, 0);
+        switch(byte_len)
+        {
+            case -1:
+                this->HandleSocketListener(nt, EPOLLIN|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, 0);
+                CNet::ExcuteReceiveCallBack(CSocketUser::GetSocketUser(nt->fd_socket));
+                return;
+            case 0:
+                return;
+            default:
+                if (byte_len < _MAX_RECEIVE_ONCE_SIZE){
+                    if (buffer[byte_len-1] != '\0'){
+                        buffer[byte_len] = '\0';
+                        byte_len = byte_len + 1;
+                    }
+                }
+                auto socket_user = CSocketUser::GetSocketUser(nt->fd_socket);
+                if (socket_user){
+                    (socket_user->_GetRecvBuffer())->Write(buffer, byte_len);
+                    //cb(socket_user);
+                }
+                else{
+                    GPRINTE("no socket_user!");
+                    return;
+                }
+        }
+    }
+}
+
+void CLinuxHandler::Writeable(struct NetThread_Linux* nt, CNetBase *net_base)
+{
+    auto socket_user = CSocketUser::GetSocketUser(nt->fd_socket);
+    if (socket_user != NULL)
+    {
+        GPRINTN("set socket writable"+to_string(nt->fd_socket));
+        socket_user->SetWriteable();
+        this->HandleSocketListener(nt, EPOLLIN|EPOLLRDHUP|EPOLLET|EPOLLONESHOT, 0);
+        CNet::ExcuteWriteableCallBack(socket_user);
+    }
+}
 // end region net
+
+void AcceptCallBack2(SocketUser socket_user)
+{
+    GPRINTD("accept callback22222");
+    char buff[_IP_INFO_LEN];
+    cout << "IP: " << socket_user->GetIP(buff, _IP_INFO_LEN) << endl;
+    cout << "Port: " << socket_user->GetPort() << endl;
+    cout << "fd: " << socket_user->GetSocketFD() << endl;
+}
 
 int main(int argc, char* argv[])
 {
@@ -535,8 +1168,7 @@ int main(int argc, char* argv[])
 
     CNet net;
     net.Init(argv[1], argv[2], argv[3]);
-
-    // net.SetCallBack();
+    CNet::SetAcceptCallBack(AcceptCallBack2);
 
     net.Run();
     return 0;
