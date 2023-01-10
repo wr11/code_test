@@ -1148,7 +1148,7 @@ void CLinuxHandler::Writeable(struct NetThread_Linux* nt, CNetBase *net_base)
 
 void AcceptCallBack2(SocketUser socket_user)
 {
-    GPRINTD("accept callback22222");
+    GPRINTD("my accept callback");
     char buff[_IP_INFO_LEN];
     cout << "IP: " << socket_user->GetIP(buff, _IP_INFO_LEN) << endl;
     cout << "Port: " << socket_user->GetPort() << endl;

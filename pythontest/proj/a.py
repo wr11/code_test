@@ -1,8 +1,8 @@
-def A():
-	pass
+# def A():
+# 	pass
 
-def OnReload():
-	A()
+# def OnReload():
+# 	A()
 
 # import pymysql
 # import pymysql.cursors
@@ -67,11 +67,6 @@ def OnReload():
 # A(1)
 # A(2)
 
-def LogFile(sMsg):
-	import os
-	sCurPath = os.getcwd()
-	sLogFilePath = "%s\%s"%(sCurPath, "log")
-	with open("log\serverlog\error\log.txt", "a") as oFile:
-		oFile.write("%s\n"%sMsg)
-
-LogFile("ppp")
+def GGG():
+	a=600606
+	print("test GGG", a)
