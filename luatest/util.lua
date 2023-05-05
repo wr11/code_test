@@ -1,11 +1,9 @@
--- 将 Lua table 类型数据转换成字符串
--- 判断字符串str是否start开头
+
 function isStart(s, prefix)
     if prefix == nil then return true end
     return string.sub(s,1,string.len(prefix)) == prefix
 end
 
--- 判断字符串str是否end结尾
 function isEnd(s, suffix)
     if suffix == nil then return true end
     return suffix == '' or string.sub(s,-string.len(suffix)) == suffix
@@ -46,7 +44,6 @@ function isinteger(v)
     return math.type(v) == "integer" 
 end
 
--- 是否是数组
 function isArray(tb)
     if not tb then return end
     local len = 0
@@ -76,7 +73,7 @@ function table2strNoFormat(tb, tbDict)
     tbDict[tb] = true
 
     local str = "{"
-    if isArray(tb) and #tb > 0 then -- 数组
+    if isArray(tb) and #tb > 0 then -- ????
         for k, v in ipairs(tb) do
             local comma = ","
             if k == #tb then
@@ -120,20 +117,125 @@ function table2strNoFormat(tb, tbDict)
     return str
 end
 
--- 打印 Lua table 类型数据
 function printTable(t)
     print(table2strNoFormat(t))
 end
 
-local t = {
-    name = "张三",
-    age = 18,
-    gender = "男",
-    interests = {"游泳", "篮球", "音乐"},
-    job = {
-        title = "软件工程师",
-        salary = 10000
-    }
-}
+--[[
 
--- printTable(t)
+local _ENV = moduleDef("TestMod", {
+	var1 = 100,
+	var2 = "kaka"
+})
+
+或者
+local _ENV = moduleDef("TestMod", function ()
+	local M = {}
+	M.var1 = 100,
+	M.var2 = "kaka"
+	return M
+end)
+
+
+-- 模块内就不要再定义任何变量了，所有变量都定义在moduleDef里面！！！！
+
+function func1()
+	print("member func", var1, var2)
+end
+
+function func2()
+	print("static func!!")
+end
+	
+]]
+
+--subModule 子模块，reload的时候，不会覆盖sModName对应table
+local mod_mt = {__index = _G}
+function moduleDef(sModName, mod)
+	if not _G[sModName] then
+		if type(mod) == "table" then
+			_G[sModName] = mod
+		elseif type(mod) == "function" then
+			_G[sModName] = mod()
+		else
+			assert(mod == nil)
+			_G[sModName] = {}
+		end
+
+		_G[sModName].__sModName__ = sModName
+
+		setmetatable(_G[sModName], mod_mt)
+        if _G.isGac then
+            if _G.moduleResetList then
+                moduleResetRecord(sModName)
+            end
+        end
+	end
+
+	return _G[sModName]
+end
+
+local function __initClass(cls)
+	local cls_mt = {__index = cls}
+	function cls:new(...)
+		local o = {}
+		setmetatable(o, cls_mt)
+		if cls.ctor ~= nil then
+			o:ctor(...)
+		end
+		return o
+	end
+end
+
+--[[
+	
+classDef("TestCls", {
+	staticVar1 = 100,
+	staticVar2 = "kaka"
+})
+
+-- 类的构造方法
+function TestCls:ctor(p1, p2)
+	self.var1 = p1
+	self.var2 = p2
+end
+
+function TestCls:func1()
+	print("member func", self.var1, self.var2, TestCls.staticVar1, TestCls.staticVar2)
+end
+
+----------------------
+-- 外部调用
+
+local inst = TestCls:new(1, 2)
+inst:func1()
+
+]]
+function classDef(sClsName, cls)
+	if not _G[sClsName] then
+		if type(cls) == "table" then
+			_G[sClsName] = cls
+		elseif type(cls) == "function" then
+			_G[sClsName] = cls()
+		else
+			assert(cls == nil)
+			_G[sClsName] = {}
+		end
+
+		__initClass(_G[sClsName])
+
+	end
+	return _G[sClsName]
+end
+
+function createClass()
+	local cls = {}
+	__initClass(cls)
+	return cls
+end
+
+function classDefCopyTable(tCls, tParentCls)
+    for k, v in pairs(tParentCls) do
+        tCls[k] = v
+    end
+end
