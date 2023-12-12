@@ -126,6 +126,7 @@ end
 function printTable(t)
     print(table2strNoFormat(t))
 end
+_G.PT = printTable
 
 --[[
 
